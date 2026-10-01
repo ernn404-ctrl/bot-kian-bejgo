@@ -11,7 +11,7 @@ from datetime import datetime
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-import redis.asyncio as aioredis # نسخه جدید کتابخانه ردییس
+import redis.asyncio as aioredis 
 
 # ================= Configuration =================
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
@@ -22,7 +22,7 @@ ADMIN_IDS = [int(x.strip()) for x in admin_ids_env.split(",") if x.strip().isdig
 
 # آدرس دامنه Railway شما (بدون اسلش آخر)
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://your-app.up.railway.app").rstrip('/')
-PORT = int(os.environ.get("PORT", "8080")) # Railway پورت را خودکار تنظیم می‌کند
+PORT = int(os.environ.get("PORT", "8080")) 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 APP_SECRET_HEADER = "JetApp-Secure-Client"
@@ -33,40 +33,69 @@ db = aioredis.from_url(REDIS_URL, decode_responses=True)
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 
 # ================= Helper Functions =================
-async def send_links_file(bot, chat_id):
-    records = await db.hgetall("jet:bulk_accounts")
-    if not records:
-        await bot.send_message(chat_id=chat_id, text="❌ هیچ لینکی در سیستم موجود نیست.")
-        return
+async def send_links_file(bot, chat_id, export_type="batch"):
+    """
+    export_type: 
+      "batch" -> فقط خروجی سری جدید (آخرین پردازش)
+      "all" -> خروجی کل دیتابیس از ابتدا تاکنون
+    """
+    if export_type == "batch":
+        # دریافت فقط شماره‌های سری جدید
+        batch_phones = await db.lrange("jet:current_batch", 0, -1)
+        if not batch_phones:
+            await bot.send_message(chat_id=chat_id, text="❌ هیچ اکانت جدیدی در این سری برای خروجی وجود ندارد.")
+            return
         
-    # آماده‌سازی ۳ فرمت مختلف برای خروجی
-    detailed_text = "🔗 **بخش اول: لیست جامع و شماره‌گذاری شده**\n" + "="*40 + "\n"
-    compact_text = "\n\n📱 **بخش دوم: فرمت فشرده (شماره : لینک)**\n" + "="*40 + "\n"
-    raw_links_text = "\n\n🌐 **بخش سوم: فقط لینک‌ها**\n" + "="*40 + "\n"
+        records = []
+        for p in batch_phones:
+            val = await db.hget("jet:bulk_accounts", p)
+            if val:
+                records.append(json.loads(val))
+                
+        # پاکسازی لیست موقت سری فعلی پس از استخراج
+        await db.delete("jet:current_batch")
+        caption_type = "سری جدید"
+        
+    else:
+        # دریافت کل اکانت‌ها
+        raw_records = await db.hgetall("jet:bulk_accounts")
+        if not raw_records:
+            await bot.send_message(chat_id=chat_id, text="❌ هیچ لینکی در سیستم موجود نیست.")
+            return
+        records = [json.loads(val) for val in raw_records.values()]
+        caption_type = "کل دیتابیس"
 
-    for i, (phone, val) in enumerate(records.items(), 1):
-        data = json.loads(val)
+    # مرتب‌سازی بر اساس ردیف (ID) برای جلوگیری از به هم ریختگی
+    records.sort(key=lambda x: x.get('id', 0))
+
+    detailed_text = f"🔗 **بخش اول: لیست جامع ({caption_type})**\n" + "="*40 + "\n"
+    compact_text = f"\n\n📱 **بخش دوم: فرمت فشرده ({caption_type})**\n" + "="*40 + "\n"
+    raw_links_text = f"\n\n🌐 **بخش سوم: فقط لینک‌ها ({caption_type})**\n" + "="*40 + "\n"
+
+    for data in records:
         link = f"{WEBHOOK_URL}/auth/{data['token']}"
         name = data.get('name', 'کاربر')
+        phone = data.get('phone', 'نامشخص')
+        row_id = data.get('id', '?') # ردیف پیوسته دیتابیس
 
         # 1. فرمت جامع شماره‌گذاری شده
-        detailed_text += f"{i}. 📱 {phone} | 👤 {name}\n   🔗 {link}\n"
+        detailed_text += f"ردیف {row_id} | 📱 {phone} | 👤 {name}\n   🔗 {link}\n"
         # 2. فرمت فشرده
-        compact_text += f"{phone}  ➡️  {link}\n"
+        compact_text += f"{row_id}. {phone}  ➡️  {link}\n"
         # 3. لینک خام
         raw_links_text += f"{link}\n"
 
     full_content = detailed_text + compact_text + raw_links_text
         
     file_bytes = BytesIO(full_content.encode('utf-8'))
-    file_bytes.name = f"Nexus_Links_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    file_bytes.name = f"Nexus_Links_{caption_type}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
     
     caption_text = (
-        f"✅ **خروجی لینک‌ها با موفقیت آماده شد!**\n\n"
-        f"📊 **تعداد کل اکانت‌ها:** {len(records)}\n\n"
+        f"✅ **خروجی لینک‌ها ({caption_type}) با موفقیت آماده شد!**\n\n"
+        f"📊 **تعداد اکانت‌های این فایل:** {len(records)}\n\n"
         f"داخل فایل پیوست ۳ مدل خروجی قرار دارد:\n"
-        f"1️⃣ لیست شماره‌گذاری شده با نام و شماره\n"
-        f"2️⃣ فرمت (شماره ➡️ لینک)\n"
+        f"1️⃣ لیست با نام، شماره و ردیف کل\n"
+        f"2️⃣ فرمت (ردیف. شماره ➡️ لینک)\n"
         f"3️⃣ فقط لینک‌های خام زیر هم"
     )
     
@@ -82,7 +111,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("▶️ شروع پردازش همزمان", callback_data="adm_start_bulk")],
-        [InlineKeyboardButton("🔗 دریافت فایل تمام لینک‌ها", callback_data="adm_export_links")],
+        [InlineKeyboardButton("🔗 دریافت لینک‌های سری جدید", callback_data="adm_export_batch")],
+        [InlineKeyboardButton("📥 دریافت تمام لینک‌ها (کل دیتابیس)", callback_data="adm_export_all_links")],
         [InlineKeyboardButton("📦 خروجی دیتابیس JSON", callback_data="adm_export_all")],
         [InlineKeyboardButton("⚠️ پاکسازی کل دیتابیس", callback_data="adm_clear_db_warn")]
     ]
@@ -101,9 +131,14 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.rpush("bot:admin_commands", "START_BULK")
         await query.message.reply_text("🚀 عملیات پردازش آغاز شد. گزارشات به زودی در همین چت ارسال می‌شوند...", parse_mode="Markdown")
 
-    elif query.data == "adm_export_links":
-        msg = await query.message.reply_text("⏳ در حال ساخت فایل چندگانه لینک‌ها...")
-        await send_links_file(context.bot, query.message.chat.id)
+    elif query.data == "adm_export_batch":
+        msg = await query.message.reply_text("⏳ در حال ساخت فایل لینک‌های سری جدید...")
+        await send_links_file(context.bot, query.message.chat.id, export_type="batch")
+        await msg.delete()
+
+    elif query.data == "adm_export_all_links":
+        msg = await query.message.reply_text("⏳ در حال ساخت فایل تمامی لینک‌ها...")
+        await send_links_file(context.bot, query.message.chat.id, export_type="all")
         await msg.delete()
 
     elif query.data == "adm_export_all":
@@ -125,18 +160,18 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ انصراف", callback_data="adm_cancel_action")]
         ]
         await query.message.reply_text(
-            "⚠️ **هشدار امنیتی!**\nآیا از پاکسازی کل دیتابیس اطمینان دارید؟\nاین عملیات تمام لینک‌ها، نشست‌ها و حافظه خطوط استخراج شده را به صورت کامل پاک می‌کند.", 
+            "⚠️ **هشدار امنیتی!**\nآیا از پاکسازی کل دیتابیس اطمینان دارید؟\nاین عملیات تمام لینک‌ها، نشست‌ها، شمارنده‌ها و حافظه خطوط استخراج شده را به صورت کامل پاک می‌کند.", 
             reply_markup=InlineKeyboardMarkup(warn_keyboard), 
             parse_mode="Markdown"
         )
 
     elif query.data == "adm_clear_db_confirm":
-        await db.delete("jet:processed_phones")
-        await db.delete("jet:bulk_accounts")
+        # پاکسازی تمامی رکوردهای مرتبط
+        await db.delete("jet:processed_phones", "jet:bulk_accounts", "jet:current_batch", "jet:account_counter")
         keys = await db.keys("jet_session:*")
         if keys:
             await db.delete(*keys)
-        await query.message.edit_text("🧹 دیتابیس با موفقیت به صورت کامل فلش شد.")
+        await query.message.edit_text("🧹 دیتابیس و شمارنده‌ها با موفقیت به صورت کامل فلش شدند.")
 
     elif query.data == "adm_cancel_action":
         await query.message.edit_text("✅ عملیات لغو شد.")
@@ -150,9 +185,10 @@ async def alert_listener(app: Application):
                 for admin_id in ADMIN_IDS:
                     try:
                         await app.bot.send_message(chat_id=admin_id, text=alert, parse_mode="Markdown")
+                        # وقتی عملیات دیجی‌کالا تمام می‌شود، فقط خروجی همان سری جدید (batch) ارسال می‌شود
                         if "گزارش نهایی" in alert:
-                            await app.bot.send_message(chat_id=admin_id, text="⏳ در حال آماده‌سازی خودکار فایل لینک‌ها...")
-                            await send_links_file(app.bot, admin_id)
+                            await app.bot.send_message(chat_id=admin_id, text="⏳ در حال آماده‌سازی خودکار فایل لینک‌های این سری...")
+                            await send_links_file(app.bot, admin_id, export_type="batch")
                     except Exception:
                         pass
         except Exception:
@@ -193,9 +229,18 @@ async def token_generator_worker():
                 
                 session_token = secrets.token_urlsafe(14)
                 
+                # تولید ردیف (شماره سریال) یکتا و پیوسته برای این اکانت
+                global_id = await db.incr("jet:account_counter")
+                
                 await db.setex(f"jet_session:{session_token}", 30 * 24 * 3600, json.dumps(final_json, ensure_ascii=False))
-                record = {"phone": phone, "token": session_token, "name": name}
+                
+                # ذخیره اطلاعات همراه با ردیف اختصاصی
+                record = {"phone": phone, "token": session_token, "name": name, "id": global_id}
                 await db.hset("jet:bulk_accounts", phone, json.dumps(record, ensure_ascii=False))
+                
+                # اضافه کردن به لیست موقت "سری جدید" برای خروجی‌گیری هوشمند
+                await db.rpush("jet:current_batch", phone)
+                
         except Exception:
             pass
         await asyncio.sleep(1)
